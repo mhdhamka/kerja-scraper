@@ -1,5 +1,8 @@
+import html
+import math
 import sys
 from pathlib import Path
+from urllib.parse import urlparse
 import duckdb
 import pandas as pd
 import streamlit as st
@@ -8,6 +11,9 @@ import streamlit as st
 sys.path.append(str(Path(__file__).resolve().parents[2]))
 from src.database.connection import get_connection
 from src.processing.matcher import JobMatcher
+
+PAGE_SIZE = 10
+URL_CANDIDATES = ("url", "link", "job_url", "apply_url", "posting_url")
 
 st.set_page_config(
     page_title="Kerja Scraper — Job Intelligence & Tracker",
@@ -107,11 +113,32 @@ st.markdown(
         border-color: #0A66C2;
         box-shadow: 0 4px 12px rgba(10, 102, 194, 0.08);
     }
+    .job-card-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: flex-start;
+        gap: 12px;
+        margin-bottom: 8px;
+    }
     .job-title {
         font-size: 1.05rem;
         font-weight: 700;
         color: #0A66C2;
-        margin: 0 0 8px 0;
+        margin: 0;
+    }
+    .job-apply-link {
+        display: inline-block;
+        flex-shrink: 0;
+        background-color: #0A66C2;
+        color: #FFFFFF !important;
+        text-decoration: none;
+        font-size: 0.78rem;
+        font-weight: 600;
+        padding: 5px 12px;
+        border-radius: 8px;
+    }
+    .job-apply-link:hover {
+        background-color: #004182;
     }
     .job-meta-row {
         display: flex;
@@ -149,6 +176,11 @@ st.markdown(
         font-size: 0.76rem;
         border: 1px solid #F7DFAD;
     }
+    .match-breakdown {
+        font-size: 0.78rem;
+        color: #4B5563;
+        margin-bottom: 8px;
+    }
     .skill-pill {
         display: inline-block;
         background-color: #F3F4F6;
@@ -165,6 +197,13 @@ st.markdown(
         color: #0A66C2;
         border-color: #B8D4F2;
         font-weight: 600;
+    }
+    .page-status {
+        text-align: center;
+        font-size: 0.88rem;
+        font-weight: 600;
+        color: #374151;
+        padding-top: 6px;
     }
 
     /* Navigation Tabs */
@@ -228,8 +267,34 @@ st.markdown(
 tab1, tab2 = st.tabs(["Market Intelligence", "My Applications Pipeline"])
 
 
+def open_readonly_connection():
+    """Open a read-only DuckDB connection safely for concurrent UI reads."""
+    db_path = Path(__file__).resolve().parents[2] / "data" / "job_market.duckdb"
+    try:
+        return get_connection(read_only=True)
+    except TypeError:
+        try:
+            return get_connection()
+        except Exception:
+            return duckdb.connect(database=str(db_path), read_only=True)
+    except Exception:
+        return duckdb.connect(database=str(db_path), read_only=True)
+
+
+def sanitize_http_url(val):
+    if val is None or (isinstance(val, float) and pd.isna(val)):
+        return None
+    raw = str(val).strip()
+    if not raw:
+        return None
+    parsed = urlparse(raw)
+    if parsed.scheme in ("http", "https") and parsed.netloc:
+        return html.escape(raw, quote=True)
+    return None
+
+
 def render_skill_pills(skills_val, matched_set=None):
-    if skills_val is None:
+    if skills_val is None or (isinstance(skills_val, float) and pd.isna(skills_val)):
         return "<span style='color:#6B7280;font-size:0.78rem;'>No skills extracted</span>"
     if isinstance(skills_val, str):
         skills_iter = [s.strip() for s in skills_val.split(",") if s.strip()]
@@ -245,8 +310,9 @@ def render_skill_pills(skills_val, matched_set=None):
     matched_upper = {str(m).upper() for m in (matched_set or [])}
     pills = []
     for sk in skills_iter[:8]:
+        safe_sk = html.escape(str(sk))
         hit_cls = " skill-pill-hit" if str(sk).upper() in matched_upper else ""
-        pills.append(f"<span class='skill-pill{hit_cls}'>{sk}</span>")
+        pills.append(f"<span class='skill-pill{hit_cls}'>{safe_sk}</span>")
     if len(skills_iter) > 8:
         pills.append(f"<span class='skill-pill'>+{len(skills_iter) - 8} more</span>")
     return "".join(pills)
@@ -256,9 +322,12 @@ def render_skill_pills(skills_val, matched_set=None):
 # TAB 1: MARKET INTELLIGENCE
 # =========================================================
 with tab1:
-    @st.cache_data
+    if "job_page" not in st.session_state:
+        st.session_state.job_page = 1
+
+    @st.cache_data(ttl=120)
     def load_data():
-        con = get_connection(read_only=False)
+        con = open_readonly_connection()
         try:
             table_exists = (
                 con.execute(
@@ -278,11 +347,20 @@ with tab1:
 
     df_jobs = load_data()
     source_col = next((col for col in ["source", "platform", "board"] if col in df_jobs.columns), None)
+    url_col = next((col for col in URL_CANDIDATES if col in df_jobs.columns), None)
 
     if df_jobs.empty:
         st.warning("No job records found in the warehouse yet. Run your daily pipeline first!")
+        if st.button("Refresh Data"):
+            st.cache_data.clear()
+            st.rerun()
     else:
         st.sidebar.markdown("### Search & Filter")
+
+        if st.sidebar.button("Refresh Data", use_container_width=True):
+            st.cache_data.clear()
+            st.session_state.job_page = 1
+            st.rerun()
 
         if source_col:
             available_sources = df_jobs[source_col].dropna().unique().tolist()
@@ -326,6 +404,20 @@ with tab1:
             [s.strip() for s in user_skills_input.split(",") if s.strip()] if user_skills_input else []
         )
 
+        min_match_score = st.sidebar.slider(
+            "Minimum Skill Match (%)",
+            min_value=0,
+            max_value=100,
+            value=0,
+            step=10,
+            disabled=not bool(user_skills_list),
+        )
+
+        sort_by = st.sidebar.selectbox(
+            "Sort Feed By",
+            options=["Match Score (High to Low)", "Latest Posted"] if user_skills_list else ["Latest Posted"],
+        )
+
         filtered_df = df_jobs.copy()
 
         if source_col and selected_sources:
@@ -341,27 +433,6 @@ with tab1:
                 & (filtered_df["created_at_dt"].dt.date <= end_date)
             ]
 
-        matched_lookup = {}
-        if user_skills_list and "skills" in filtered_df.columns:
-            match_percentages = []
-            matching_details = []
-            missing_details = []
-
-            for idx, job_skills in enumerate(filtered_df["skills"]):
-                clean_user_skills = list(user_skills_list)
-                clean_job_skills = list(job_skills) if job_skills is not None else []
-
-                match_result = JobMatcher.calculate_match(clean_user_skills, clean_job_skills)
-                match_percentages.append(match_result["match_percentage"])
-                matching_details.append(", ".join(match_result["matching_skills"]))
-                missing_details.append(", ".join(match_result["missing_skills"]))
-                matched_lookup[idx] = match_result["matching_skills"]
-
-            filtered_df["match_score (%)"] = match_percentages
-            filtered_df["matching_skills"] = matching_details
-            filtered_df["missing_skills"] = missing_details
-            filtered_df = filtered_df.sort_values(by="match_score (%)", ascending=False)
-
         search_query = st.text_input(
             "Search roles or keywords",
             placeholder="Search job titles or keywords (e.g., Data Engineer, Python, Kuching)...",
@@ -372,8 +443,70 @@ with tab1:
                 filtered_df["title"].str.contains(search_query, case=False, na=False)
             ]
 
+        filtered_df = filtered_df.reset_index(drop=True)
+
+        if user_skills_list and "skills" in filtered_df.columns:
+            match_percentages = []
+            matching_lists = []
+            missing_lists = []
+            matching_details = []
+            missing_details = []
+
+            for job_skills in filtered_df["skills"]:
+                clean_user_skills = list(user_skills_list)
+                clean_job_skills = list(job_skills) if job_skills is not None else []
+
+                match_result = JobMatcher.calculate_match(clean_user_skills, clean_job_skills)
+                m_skills = list(match_result.get("matching_skills") or [])
+                x_skills = list(match_result.get("missing_skills") or [])
+
+                match_percentages.append(match_result["match_percentage"])
+                matching_lists.append(m_skills)
+                missing_lists.append(x_skills)
+                matching_details.append(", ".join(m_skills))
+                missing_details.append(", ".join(x_skills))
+
+            filtered_df["match_score (%)"] = match_percentages
+            filtered_df["_matching_list"] = matching_lists
+            filtered_df["_missing_list"] = missing_lists
+            filtered_df["matching_skills"] = matching_details
+            filtered_df["missing_skills"] = missing_details
+
+            if min_match_score > 0:
+                filtered_df = filtered_df[filtered_df["match_score (%)"] >= min_match_score]
+
+            if sort_by == "Match Score (High to Low)":
+                filtered_df = filtered_df.sort_values(by="match_score (%)", ascending=False)
+            elif "created_at_dt" in filtered_df.columns:
+                filtered_df = filtered_df.sort_values(by="created_at_dt", ascending=False)
+
+            filtered_df = filtered_df.reset_index(drop=True)
+
+        matched_lookup = {
+            idx: row["_matching_list"]
+            for idx, row in filtered_df.iterrows()
+            if "_matching_list" in filtered_df.columns
+        }
+
+        filter_sig = (
+            tuple(sorted(selected_sources)),
+            selected_location,
+            str(date_range),
+            search_query.strip().lower(),
+            tuple(s.lower() for s in user_skills_list),
+            min_match_score if user_skills_list else 0,
+            sort_by,
+        )
+        if st.session_state.get("last_filter_sig") != filter_sig:
+            st.session_state.last_filter_sig = filter_sig
+            st.session_state.job_page = 1
+
         total_jobs = len(df_jobs)
         filtered_count = len(filtered_df)
+        total_pages = max(1, math.ceil(filtered_count / PAGE_SIZE))
+        st.session_state.job_page = max(1, min(st.session_state.job_page, total_pages))
+        current_page = st.session_state.job_page
+
         unique_platforms = (
             filtered_df[source_col].nunique() if source_col and source_col in filtered_df.columns else 1
         )
@@ -390,60 +523,97 @@ with tab1:
 
         st.markdown("<br>", unsafe_allow_html=True)
 
-        feed_col, table_col = st.columns([1.15, 1.35], gap="large")
+        # Single Job Feed Preview with 10 jobs per page
+        st.markdown("### Job Feed Preview")
+        if filtered_df.empty:
+            st.info("No roles match your current search or filter criteria.")
+        else:
+            start_idx = (current_page - 1) * PAGE_SIZE
+            end_idx = start_idx + PAGE_SIZE
+            page_df = filtered_df.iloc[start_idx:end_idx]
 
-        with feed_col:
-            st.markdown("### Job Feed Preview")
-            if filtered_df.empty:
-                st.info("No roles match your current search or filter criteria.")
-            else:
-                for idx, (_, row) in enumerate(filtered_df.head(8).iterrows()):
-                    title = str(row.get("title", "Untitled Role"))
-                    platform = str(row.get(source_col, "Job Board")) if source_col else "Job Board"
-                    location = (
-                        str(row.get("location"))
-                        if "location" in row and pd.notna(row.get("location"))
-                        else "Malaysia / Remote"
-                    )
-                    salary = (
-                        str(row.get("salary_range"))
-                        if "salary_range" in row and pd.notna(row.get("salary_range"))
-                        else "Salary not listed"
-                    )
-                    match_badge = (
-                        f"<span class='badge-match'>{row['match_score (%)']}% Match</span>"
-                        if "match_score (%)" in row and pd.notna(row.get("match_score (%)"))
-                        else ""
-                    )
-                    pills_html = render_skill_pills(row.get("skills"), matched_lookup.get(idx))
+            for row_idx, row in page_df.iterrows():
+                title_safe = html.escape(
+                    str(row.get("title")) if pd.notna(row.get("title")) else "Untitled Role"
+                )
+                platform_safe = html.escape(
+                    str(row.get(source_col)) if source_col and pd.notna(row.get(source_col)) else "Job Board"
+                )
+                location_safe = html.escape(
+                    str(row.get("location"))
+                    if "location" in row and pd.notna(row.get("location"))
+                    else "Malaysia / Remote"
+                )
+                salary_safe = html.escape(
+                    str(row.get("salary_range"))
+                    if "salary_range" in row and pd.notna(row.get("salary_range"))
+                    else "Salary not listed"
+                )
 
-                    card_html = (
-                        f"<div class='surface-card'>"
-                        f"<div class='job-title'>{title}</div>"
-                        f"<div class='job-meta-row'>"
-                        f"<span class='badge-platform'>{platform}</span>"
-                        f"<span>{location}</span>"
-                        f"<span class='badge-salary'>{salary}</span>"
-                        f"{match_badge}"
+                safe_url = sanitize_http_url(row.get(url_col)) if url_col else None
+                apply_html = (
+                    f"<a class='job-apply-link' href='{safe_url}' target='_blank' rel='noopener noreferrer'>View Listing ↗</a>"
+                    if safe_url
+                    else ""
+                )
+
+                match_badge = (
+                    f"<span class='badge-match'>{row['match_score (%)']}% Match</span>"
+                    if "match_score (%)" in row and pd.notna(row.get("match_score (%)"))
+                    else ""
+                )
+
+                breakdown_html = ""
+                if user_skills_list and "_matching_list" in row:
+                    m_list = row["_matching_list"] or []
+                    x_list = row["_missing_list"] or []
+                    m_text = html.escape(", ".join(m_list)) if m_list else "None"
+                    x_preview = html.escape(", ".join(x_list[:5])) if x_list else "None"
+                    extra_missing = f" (+{len(x_list) - 5} more)" if len(x_list) > 5 else ""
+                    breakdown_html = (
+                        f"<div class='match-breakdown'>"
+                        f"<strong>Matched ({len(m_list)}):</strong> {m_text} · "
+                        f"<strong>Missing ({len(x_list)}):</strong> {x_preview}{html.escape(extra_missing)}"
                         f"</div>"
-                        f"<div>{pills_html}</div>"
-                        f"</div>"
                     )
-                    st.markdown(card_html, unsafe_allow_html=True)
 
-        with table_col:
-            st.markdown("### All Listings & Match Breakdown")
-            base_cols = ["id", "title"]
-            if source_col:
-                base_cols.append(source_col)
-            if "location" in filtered_df.columns:
-                base_cols.append("location")
+                pills_html = render_skill_pills(row.get("skills"), matched_lookup.get(row_idx))
 
-            match_cols = ["match_score (%)", "skills", "missing_skills"] if user_skills_list else ["skills"]
-            tail_cols = ["salary_range", "created_at"]
-            display_cols = [col for col in base_cols + match_cols + tail_cols if col in filtered_df.columns]
+                card_html = (
+                    f"<div class='surface-card'>"
+                    f"<div class='job-card-header'>"
+                    f"<div class='job-title'>{title_safe}</div>"
+                    f"{apply_html}"
+                    f"</div>"
+                    f"<div class='job-meta-row'>"
+                    f"<span class='badge-platform'>{platform_safe}</span>"
+                    f"<span>{location_safe}</span>"
+                    f"<span class='badge-salary'>{salary_safe}</span>"
+                    f"{match_badge}"
+                    f"</div>"
+                    f"{breakdown_html}"
+                    f"<div>{pills_html}</div>"
+                    f"</div>"
+                )
+                st.markdown(card_html, unsafe_allow_html=True)
 
-            st.dataframe(filtered_df[display_cols], use_container_width=True, hide_index=True, height=540)
+            # Pagination controls
+            p_prev, p_info, p_next = st.columns([1, 2, 1])
+            with p_prev:
+                if st.button("← Previous", disabled=(current_page <= 1), use_container_width=True):
+                    st.session_state.job_page = current_page - 1
+                    st.rerun()
+            with p_info:
+                showing_start = start_idx + 1
+                showing_end = min(end_idx, filtered_count)
+                st.markdown(
+                    f"<div class='page-status'>Page {current_page} of {total_pages} · Showing {showing_start}–{showing_end} of {filtered_count}</div>",
+                    unsafe_allow_html=True,
+                )
+            with p_next:
+                if st.button("Next →", disabled=(current_page >= total_pages), use_container_width=True):
+                    st.session_state.job_page = current_page + 1
+                    st.rerun()
 
         st.markdown("<br>", unsafe_allow_html=True)
 
@@ -483,16 +653,14 @@ with tab2:
         unsafe_allow_html=True,
     )
 
+    con = None
     try:
-        db_path = Path(__file__).resolve().parents[2] / "data" / "job_market.duckdb"
-        con = duckdb.connect(database=str(db_path), read_only=True)
-
+        con = open_readonly_connection()
         tables = con.execute("SHOW TABLES").fetchall()
         table_names = [t[0] for t in tables]
 
         if "job_applications" in table_names:
             df_apps = con.execute("SELECT * FROM job_applications ORDER BY applied_at DESC").fetchdf()
-            con.close()
 
             if not df_apps.empty:
                 c1, c2, c3 = st.columns(3)
@@ -508,6 +676,8 @@ with tab2:
                 )
         else:
             st.warning("The job_applications table hasn't been initialized yet. Run connection.py to create it.")
-            con.close()
     except Exception as e:
         st.error(f"Error loading applications: {e}")
+    finally:
+        if con is not None:
+            con.close()
